@@ -2,7 +2,7 @@ use std::ptr;
 
 use ffmpeg::{
     AV_CH_LAYOUT_STEREO, AV_CODEC_CAP_VARIABLE_FRAME_SIZE, AVChannelLayout,
-    AVChannelLayout__bindgen_ty_1, AVChannelOrder, AVCodecID, AVRational, AVSampleFormat,
+    AVChannelLayout__bindgen_ty_1, AVChannelOrder, AVCodecConfig, AVCodecID, AVRational, AVSampleFormat,
     av_rescale_q,
 };
 
@@ -45,30 +45,61 @@ pub fn new_audio_streams(
     let codec_ctx_ptr = codec_ctx.as_ptr();
 
     {
-        let sample_fmts = unsafe { (*codec_ptr).sample_fmts };
+        // Use modern FFmpeg API (avcodec_get_supported_config) instead of deprecated
+        // AVCodec fields sample_fmts and supported_samplerates
+        let mut sample_fmt = AVSampleFormat::AV_SAMPLE_FMT_FLTP;
+        let mut sample_rate = 44100;
 
         unsafe {
-            (*codec_ctx_ptr).sample_fmt = if sample_fmts.is_null() {
-                AVSampleFormat::AV_SAMPLE_FMT_FLTP
-            } else {
-                *(*codec_ptr).sample_fmts
-            };
-
-            (*codec_ctx_ptr).bit_rate = 64000;
-            (*codec_ctx_ptr).sample_rate = 44100;
-
-            let supported_samplerates = (*codec_ptr).supported_samplerates;
-
-            if !supported_samplerates.is_null() {
-                (*codec_ctx_ptr).sample_rate = *supported_samplerates.offset(0);
-                let mut i = 0;
-                while *supported_samplerates.offset(i) != 0 {
-                    if *supported_samplerates.offset(i) == 44100 {
-                        (*codec_ctx_ptr).sample_rate = 44100;
-                    }
-                    i += 1;
-                }
+            // Query supported sample formats
+            let mut out_configs: *const libc::c_void = ptr::null();
+            let mut out_num_configs: libc::c_int = 0;
+            let ret = ffmpeg::avcodec_get_supported_config(
+                ptr::null(),
+                codec_ptr,
+                AVCodecConfig::AV_CODEC_CONFIG_SAMPLE_FORMAT,
+                0,
+                &mut out_configs,
+                &mut out_num_configs,
+            );
+            if ret >= 0 && !out_configs.is_null() && out_num_configs > 0 {
+                let fmts = out_configs as *const AVSampleFormat;
+                // Use the first supported format (typically FLTP for AAC)
+                sample_fmt = *fmts;
+                // Free the returned array
+                libc::free(out_configs as *mut libc::c_void);
             }
+
+            // Query supported sample rates
+            let mut out_configs: *const libc::c_void = ptr::null();
+            let mut out_num_configs: libc::c_int = 0;
+            let ret = ffmpeg::avcodec_get_supported_config(
+                ptr::null(),
+                codec_ptr,
+                AVCodecConfig::AV_CODEC_CONFIG_SAMPLE_RATE,
+                0,
+                &mut out_configs,
+                &mut out_num_configs,
+            );
+            if ret >= 0 && !out_configs.is_null() && out_num_configs > 0 {
+                let rates = out_configs as *const libc::c_int;
+                // Prefer 44100 if available, otherwise use first supported rate
+                for i in 0..out_num_configs {
+                    let rate = *rates.offset(i as isize);
+                    if rate == 44100 {
+                        sample_rate = 44100;
+                        break;
+                    }
+                    if i == 0 {
+                        sample_rate = rate;
+                    }
+                }
+                libc::free(out_configs as *mut libc::c_void);
+            }
+
+            (*codec_ctx_ptr).sample_fmt = sample_fmt;
+            (*codec_ctx_ptr).bit_rate = 64000;
+            (*codec_ctx_ptr).sample_rate = sample_rate;
         }
 
         let stereo_layout = AVChannelLayout {
